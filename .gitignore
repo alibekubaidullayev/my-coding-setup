@@ -1,0 +1,10 @@
+# Example .gitignore for nvim config
+*.swp
+*.swo
+*~
+.netrwhist
+plugin/packer_compiled.lua
+*.bundle
+
+# Karabiner writes these next to karabiner.json
+dotfiles/karabiner/automatic_backups/

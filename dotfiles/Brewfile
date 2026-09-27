@@ -1,0 +1,26 @@
+# Everything the nvim + tmux + zsh + ta flow needs. Homebrew runs on macOS and
+# Linux, so both get the same (recent) versions: ta needs fzf >= 0.61, the nvim
+# config needs Neovim >= 0.12. zsh itself comes from the system (see install.sh).
+
+brew "git"
+brew "tmux"
+brew "neovim"
+brew "tree-sitter-cli" # nvim-treesitter (main branch) builds parsers with it
+brew "ripgrep"
+brew "fd"
+brew "fzf"
+brew "bat"
+brew "eza"
+brew "zoxide"
+brew "direnv"
+brew "atuin"
+brew "lazygit"
+brew "git-delta"
+brew "gh"
+brew "node" # LSP servers that mason installs (pyright, ts_ls, ...)
+brew "uv"
+
+if OS.mac?
+  cask "ghostty"
+  cask "karabiner-elements" # hold Caps Lock + key = tmux prefix + key
+end

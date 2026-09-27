@@ -1,0 +1,14 @@
+gui:
+  nerdFontsVersion: "3"
+  border: rounded
+  theme:
+    activeBorderColor: ["#789978", bold]
+    inactiveBorderColor: ["#2a2a2a"]
+    selectedLineBgColor: ["#191919"]
+    optionsTextColor: ["#7a7a7a"]
+    unstagedChangesColor: ["#ffaa88"]
+    defaultFgColor: ["#cccccc"]
+    searchingActiveBorderColor: ["#deeeed"]
+git:
+  diffRenderers:
+    - command: delta --dark --paging=never

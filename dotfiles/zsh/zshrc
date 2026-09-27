@@ -1,0 +1,149 @@
+export ZSH="$HOME/.oh-my-zsh"
+export KEYTIMEOUT=1
+ZSH_THEME="robbyrussell"
+
+plugins=(
+    git
+    zsh-autosuggestions
+    zsh-syntax-highlighting
+)
+
+CASE_SENSITIVE=true
+
+source "$ZSH/oh-my-zsh.sh"
+
+# Keep PATH unique and add only directories that exist.
+typeset -U path PATH
+path_prepend_if_dir() { [[ -d "$1" ]] && path=("$1" $path) }
+path_append_if_dir() { [[ -d "$1" ]] && path+=("$1") }
+
+# Added by Antigravity
+path_prepend_if_dir "$HOME/.antigravity/antigravity/bin"
+path_prepend_if_dir "/opt/homebrew/bin"
+path_prepend_if_dir "/home/linuxbrew/.linuxbrew/bin"
+path_prepend_if_dir "$HOME/.local/bin"
+path_append_if_dir "$HOME/.composer/vendor/bin"
+
+# Go bins
+path_prepend_if_dir "$HOME/go/bin"
+if command -v go >/dev/null 2>&1; then
+    GO_GOBIN="$(go env GOBIN 2>/dev/null)"
+    [[ -n "$GO_GOBIN" ]] && path_prepend_if_dir "$GO_GOBIN"
+    unset GO_GOBIN
+fi
+
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+path_append_if_dir "$ANDROID_HOME/platform-tools"
+path_append_if_dir "$ANDROID_HOME/tools"
+path_append_if_dir "/usr/local/opt/rabbitmq/sbin"
+
+if [ -f "$HOME/.local/bin/env" ]; then
+    source "$HOME/.local/bin/env"
+fi
+
+alias pip=pip3
+alias g++='g++ -std=c++20'
+alias clang++='clang++ -std=c++17'
+[[ $OSTYPE == darwin* ]] && alias zed="open -a /Applications/Zed.app -n"
+alias python="python3"
+
+if command -v pyenv >/dev/null 2>&1; then
+    eval "$(pyenv init -)"
+fi
+
+export LANG=en_US.UTF-8
+
+crun() {
+    output="crun.out"
+    cc "$@" -o $output && ./$output
+}
+
+function fzf_cd() {
+    local file
+    file=$(fzf --query="$1")
+    if [ -n "$file" ]; then
+        cd "$(dirname "$file")" || return
+    fi
+}
+alias ff="fzf_cd"
+
+export FZF_DEFAULT_COMMAND='fd --type f --strip-cwd-prefix'
+export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+
+alias tmls="tmux ls"
+alias tnew="tmux new -s"
+alias tks="tmux kill-session -t"
+alias tka="tmux kill-server"
+alias tmat="tmux attach -t"
+alias tdet="tmux detach"
+alias tsw="tmux switch -t"
+alias tres="tmux source-file ~/.tmux.conf" 
+
+# ta: tmux session/window picker → ~/.local/bin/ta
+alias tms="ta"
+
+alias vi="nvim"
+alias uvnv="source .venv/bin/activate"
+
+if [[ -o interactive && -t 0 ]]; then
+    if [[ -f "$HOME/.fzf.zsh" ]]; then
+        source "$HOME/.fzf.zsh"
+    elif command -v fzf >/dev/null 2>&1; then
+        source <(fzf --zsh)   # fzf >= 0.48 (Homebrew): ctrl-t / alt-c key bindings
+    fi
+fi
+
+for map in emacs viins vicmd; do
+  bindkey -M $map -r '\ec' 2>/dev/null
+done
+
+# opencode
+path_prepend_if_dir "$HOME/.opencode/bin"
+
+# ── modern CLI ────────────────────────────────────────────────────────────────
+export BAT_THEME="ansi"   # follows the terminal's lackluster palette
+command -v bat >/dev/null 2>&1 && export MANPAGER="sh -c 'col -bx | bat -l man -p'"
+export FZF_DEFAULT_OPTS="--layout=reverse --border=rounded --info=inline-right --pointer='▌' \
+  --color=fg:#aaaaaa,fg+:#deeeed,bg:-1,bg+:#191919,hl:#deeeed:bold:underline,hl+:#deeeed:bold:underline \
+  --color=info:#555555,prompt:#789978,pointer:#789978,marker:#789978,spinner:#7a7a7a,header:#7a7a7a \
+  --color=border:#2a2a2a,label:#7a7a7a,query:#deeeed:bold,gutter:-1"
+export FZF_CTRL_T_OPTS="--preview 'bat --color=always --style=numbers --line-range=:300 {}'"
+
+if command -v eza >/dev/null 2>&1; then
+    alias ls='eza --icons=auto --group-directories-first'
+    alias ll='eza -la --icons=auto --git --group-directories-first'
+    alias lt='eza --tree --level=2 --icons=auto --git-ignore'
+fi
+# bat for viewing files in the terminal; real cat for flags and pipes
+if command -v bat >/dev/null 2>&1; then
+    cat() {
+        if [[ -t 1 && $# -gt 0 && $1 != -* ]]; then bat --paging=never --style=plain "$@"
+        else command cat "$@"; fi
+    }
+fi
+
+command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"                   # z <dir>, zi = interactive
+command -v direnv >/dev/null 2>&1 && eval "$(direnv hook zsh)"                   # per-project .envrc (see: venvrc)
+command -v atuin >/dev/null 2>&1 && eval "$(atuin init zsh --disable-up-arrow)" # ctrl-r history search
+
+# venvrc: make this project auto-activate its uv .venv via direnv
+venvrc() {
+    [[ -f .envrc ]] && { echo ".envrc already exists"; return 1 }
+    print -r -- 'layout uv' > .envrc && direnv allow
+}
+
+# Drop PATH entries that aren't existing directories (e.g. /usr/local/bin/python3
+# from /etc/paths, /pkg/env/global/bin from /etc/paths.d/10-pmk-global)
+path=($^path(N-/))
+
+# zsh-autosuggestions: the default fg=8 is #444444 in lackluster, barely visible on #101010
+ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=#7a7a7a'
+
+# Machine-specific additions (not in the repo)
+[[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
+
+# Ghostty: every new window opens the ta picker, so sessions get real names instead of
+# tmux's "18", "20"… (esc → plain shell here; detaching also lands back here)
+if [[ -o interactive && -t 0 && -z $TMUX && -z $NVIM && $TERM_PROGRAM == ghostty ]] && command -v ta >/dev/null 2>&1; then
+    ta
+fi

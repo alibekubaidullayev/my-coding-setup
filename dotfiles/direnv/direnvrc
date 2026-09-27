@@ -1,0 +1,10 @@
+# `layout uv` in an .envrc: create/sync the project's .venv with uv and activate it
+layout_uv() {
+  if [[ ! -d .venv ]]; then
+    log_status "creating .venv with uv"
+    uv venv --quiet
+  fi
+  VIRTUAL_ENV="$PWD/.venv"
+  PATH_add "$VIRTUAL_ENV/bin"
+  export VIRTUAL_ENV UV_ACTIVE=1
+}

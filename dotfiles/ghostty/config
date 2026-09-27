@@ -1,0 +1,16 @@
+theme = lackluster
+font-size = 20
+bell-features = no-audio
+
+# Left Option acts as Alt (tmux/fzf/nvim M- bindings); right Option still types special chars
+macos-option-as-alt = left
+
+window-padding-x = 8
+window-padding-y = 6
+window-padding-balance = true
+
+# Everything runs inside tmux, so closing a window only detaches: no "process running?" prompt
+confirm-close-surface = false
+mouse-hide-while-typing = true
+# ssh straight from ghostty: install its terminfo on the host and forward COLORTERM etc.
+shell-integration-features = ssh-terminfo,ssh-env

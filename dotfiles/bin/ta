@@ -1,0 +1,675 @@
+#!/usr/bin/env zsh
+# ta — jump between tmux sessions & windows (tmux + fzf)
+#
+#   ta [query]      open the picker (inside tmux it floats in a popup)
+#
+#   enter    jump · no match → create session named after the query (pick its dir)
+#   alt-enter  create session named after the query, even when something matches
+#   ctrl-f   open a project: pick a zoxide dir → session named after it
+#   tab      switch view: windows ⇄ sessions
+#   ctrl-e   rename (window / session)          alt-r
+#   ctrl-o   new window in selected session     alt-n
+#   ctrl-x   kill window / session (sessions: press twice)   alt-k window, alt-x session
+#   ctrl-r   refresh    ctrl-/  toggle preview    esc  quit / cancel rename
+#   opens in normal mode (unless given a query): j/k move · gg/G · i search · r rename
+#   jk       back to normal mode from search (like the nvim imap)
+#            o new window · dd or x kill · f project · p preview · q quit
+#
+#   Search looks at session / window / command names only (not paths or ages).
+#   Windows are listed most-recently-visited first (tmux.conf stamps @ta_visit).
+#
+#   TA_POPUP=0  never use a tmux popup      TA_ICONS=0  no Nerd Font icons
+
+emulate -R zsh
+setopt pipe_fail no_nomatch
+
+[[ $1 == __focus && ! -e $TA_STATE/pending ]] && exit 0
+
+# ── modal keys (vim-style, like telescope + `jk`) ──────────────────────────────
+# Every bound letter lands here, so this stays tiny: no colors, no tmux calls.
+if [[ $1 == __key ]]; then
+  zmodload zsh/datetime
+  k=$2 st=$TA_STATE S=${(q)${0:A}}
+  ui()     { print -rn -- "change-prompt($(<$st/prompt_$1))+change-input-label($(<$st/label_$1))+change-footer($(<$st/footer_$1))" }
+  stamp()  { print -rn -- $EPOCHREALTIME > $st/t$1 }
+  within() { [[ -f $st/t$1 ]] && (( EPOCHREALTIME - $(<$st/t$1) < $2 )) }
+  ch=$k; [[ $k == space ]] && ch=' '
+  # a `j` held back by the insert-mode `jk` check (below) is typed before anything
+  # else, so no key can overtake it
+  held=; [[ -f $st/pj ]] && { held=j; rm -f $st/pj }
+  case $k in
+    enter)     print -rn -- "${held:+put(j)+wait+}transform:$S __enter {1} {2}"; exit 0 ;;
+    tab)       print -rn -- "${held:+put(j)+wait+}transform:$S __tab"; exit 0 ;;
+    alt-enter) [[ ! -e $st/mode && -n $FZF_QUERY$held ]] && print -rn -- "${held:+put(j)+wait+}become:$S __new {q}"
+               exit 0 ;;
+  esac
+  if [[ -e $st/normal ]]; then
+    case $k in
+      j)         print -rn down ;;
+      k)         print -rn up ;;
+      g)         if within g 0.5; then rm -f $st/tg; print -rn first; else stamp g; fi ;;
+      G)         print -rn last ;;
+      ctrl-d)    print -rn half-page-down ;;
+      ctrl-u)    print -rn half-page-up ;;
+      q)         print -rn abort ;;
+      i|a|I|A|/) rm -f $st/normal; ui insert ;;
+      x)         print -rn -- "transform:$S __kill auto {1} {2} {3}" ;;
+      d)         if within d 0.5; then rm -f $st/td; print -rn -- "transform:$S __kill auto {1} {2} {3}"; else stamp d; fi ;;
+      r)         touch $st/was_normal; rm -f $st/normal; ui insert; print -rn -- "+transform:$S __rename {1} {2}" ;;
+      o)         print -rn -- "transform:$S __new-window {1} {2} {3}" ;;
+      f)         print -rn -- "become:$S __project" ;;
+      p)         print -rn -- "transform:$S __toggle-preview" ;;
+    esac                     # anything else (letters, digits, space, backspace…): ignored
+  elif [[ -e $st/mode ]]; then            # renaming: plain typing
+    case $k in
+      bspace) print -rn backward-delete-char ;;
+      ctrl-d) print -rn delete-char/eof ;;
+      ctrl-u) print -rn unix-line-discard ;;
+      *)      print -rn "put($ch)" ;;
+    esac
+  else
+    # `j` is held back like nvim's pending mapping, so the query (and the list)
+    # never changes on `jk`: only the prompt redraws. A lone `j` is typed after 300ms.
+    case $k in
+      j)
+        now=$EPOCHREALTIME; print -rn -- $now > $st/pj
+        { sleep 0.3; [[ $(<$st/pj) == $now ]] && rm -f $st/pj &&
+            curl -s -XPOST "localhost:$FZF_PORT" -H "x-api-key: $FZF_API_KEY" -d 'put(j)' } >/dev/null 2>&1 &!
+        [[ -n $held ]] && print -rn "put(j)" ;;
+      k)
+        if [[ -n $held ]]; then touch $st/normal; ui normal; else print -rn "put(k)"; fi ;;
+      bspace) [[ -z $held ]] && print -rn backward-delete-char ;;   # a held `j` is just dropped
+      ctrl-d) print -rn "${held:+put(j)+}delete-char/eof" ;;
+      ctrl-u) print -rn unix-line-discard ;;
+      *)      print -rn "put($held$ch)" ;;
+    esac
+  fi
+  exit 0
+fi
+
+SELF=${0:A}
+S=${(q)SELF}
+ICONS=${TA_ICONS:-1}
+
+# ── palette: lackluster (matches nvim's lackluster-mint) ─────────────────────
+typeset -A HEX=(
+  bg 101010 gray1 080808 gray2 191919 gray3 2a2a2a gray4 444444 gray5 555555
+  gray6 7a7a7a gray7 aaaaaa gray8 cccccc fg deeeed
+  accent 789978 green 789978 lack 708090 blue 7788aa yellow abab77 orange ffaa88 red d70000
+)
+typeset -A C
+for k v in ${(kv)HEX}; printf -v "C[$k]" '\e[38;2;%d;%d;%dm' 0x${v[1,2]} 0x${v[3,4]} 0x${v[5,6]}   # no forks: this runs on every fzf callback
+R=$'\e[0m' B=$'\e[1m' IT=$'\e[3m'
+# list columns are separated by " " + a no-break space: it looks like two spaces, but fzf
+# splits on it (--delimiter) so --nth can search names only, not paths / ages
+NB=$'\xc2\xa0' GAP=$' \xc2\xa0'
+
+typeset -A IC=(
+  vim $'' shell $'' python $'' node $'' git $''
+  ssh $'\U000f08c0' claude $'✻' agent $'\U000f06a9' docker $''
+  monitor $'\U000f035b' db $'' go $'' rust $'' build $''
+  pager $'\U000f0219' java $'' ruby $'' php $'' k8s $'\U000f10fe'
+  files $'' default $'' panes $'' zoom $'' bell $''
+  branch $'' folder $'' tmux $'' pencil $'' trash $''
+  plus $'' check $'' warn $'' windows $'' sessions $''
+)
+[[ $ICONS == 0 ]] && for k in ${(k)IC}; IC[$k]=''
+ic() { [[ -n ${IC[$1]} ]] && print -rn -- "${IC[$1]} " }
+
+# every color + icon handed to awk as C_<name> / I_<name>
+zmodload -F zsh/datetime p:EPOCHSECONDS
+AWKV=(-v "R=$R" -v "B=$B" -v "IT=$IT" -v "ICONS=$ICONS" -v "HOME=$HOME" -v "now=$EPOCHSECONDS" -v "G=$GAP")
+for k v in ${(kv)C}; AWKV+=(-v "C_$k=$v")
+for k v in ${(kv)IC}; AWKV+=(-v "I_$k=$v")
+
+# shared awk helpers: UTF-8 aware width/truncation, relative time, command → icon/color
+# (a plain string, not $(cat <<EOF): no fork; and zsh's `read` would upset fzf's bg-transform)
+AWKLIB='
+BEGIN { for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i
+        split("fg lack green blue yellow orange gray8 gray7", PAL, " ")
+        PC["fg"]=C_fg; PC["lack"]=C_lack; PC["green"]=C_green; PC["blue"]=C_blue
+        PC["yellow"]=C_yellow; PC["orange"]=C_orange; PC["gray8"]=C_gray8; PC["gray7"]=C_gray7 }
+function vlen(s,   n, i, c) { n = 0; for (i = 1; i <= length(s); i++) { c = ORD[substr(s, i, 1)]; if (c < 128 || c >= 192) n++ } return n }
+function trunc(s, w,   o, n, i, ch, c) {
+  if (vlen(s) <= w) return s
+  o = ""; n = 0
+  for (i = 1; i <= length(s); i++) { ch = substr(s, i, 1); c = ORD[ch]
+    if (c < 128 || c >= 192) { if (n >= w - 1) break; n++ } o = o ch }
+  return o "…" }
+function ltrunc(s, w,   o, p, n, i, ch, c) {
+  if (vlen(s) <= w) return s
+  o = ""; p = ""; n = 0
+  for (i = length(s); i >= 1; i--) { ch = substr(s, i, 1); c = ORD[ch]
+    if (c >= 128 && c < 192) { p = ch p; continue }
+    if (n >= w - 1) break
+    n++; o = ch p o; p = "" }
+  return "…" o }
+function pad(s, w,   d) { d = w - vlen(s); return d > 0 ? s sprintf("%" d "s", "") : s }
+function lpad(s, w,   d) { d = w - vlen(s); return d > 0 ? sprintf("%" d "s", "") s : s }
+function short(p) { if (index(p, HOME) == 1) p = "~" substr(p, length(HOME) + 1); return p }
+function ago(t,   d) { d = now - t
+  if (d < 60) return "now"; if (d < 3600) return int(d / 60) "m"; if (d < 86400) return int(d / 3600) "h"
+  if (d < 604800) return int(d / 86400) "d"; return int(d / 604800) "w" }
+function scol(name,   h, i) { h = 7; for (i = 1; i <= length(name); i++) h = (h * 31 + ORD[substr(name, i, 1)]) % 9973
+  return PC[PAL[h % 8 + 1]] }
+function cmd(c) {
+  CN = c; CC = C_gray7; IC = I_default
+  if (c ~ /^(n?vim?|vi|hx|helix|nano|emacs)$/)                 { IC = I_vim;     CC = C_green }
+  else if (c ~ /^-?(zsh|bash|fish|sh|nu|login)$/)              { IC = I_shell;   CC = C_gray6 }
+  else if (c ~ /^(i?python[0-9.]*|uv|pip[0-9]*|jupyter)$/)     { IC = I_python;  CC = C_yellow }
+  else if (c ~ /^(node|npm|npx|pnpm|yarn|bun|deno|tsx|vite)$/) { IC = I_node;    CC = C_green }
+  else if (c ~ /^(git|lazygit|tig|gh)$/)                       { IC = I_git;     CC = C_orange }
+  else if (c ~ /^(ssh|mosh|et)$/)                              { IC = I_ssh;     CC = C_lack }
+  else if (c == "claude" || c ~ /^[0-9]+\.[0-9]+\.[0-9]+$/)    { IC = I_claude;  CC = C_orange; CN = "claude" }
+  else if (c ~ /^(opencode|codex|aider|cursor-agent|agent|gemini)$/) { IC = I_agent; CC = C_accent }
+  else if (c ~ /^(docker|docker-compose|lazydocker|colima)$/)  { IC = I_docker;  CC = C_blue }
+  else if (c ~ /^(htop|btop|top|glances)$/)                    { IC = I_monitor; CC = C_orange }
+  else if (c ~ /^(psql|pgcli|mysql|redis-cli|sqlite3|mongosh)$/) { IC = I_db;    CC = C_lack }
+  else if (c ~ /^(go|gopls|air)$/)                             { IC = I_go;      CC = C_lack }
+  else if (c ~ /^(cargo|rustc|bacon)$/)                        { IC = I_rust;    CC = C_orange }
+  else if (c ~ /^(make|cmake|ninja|gradle|mvn)$/)              { IC = I_build;   CC = C_gray6 }
+  else if (c ~ /^(less|man|more|tail|bat)$/)                   { IC = I_pager;   CC = C_gray6 }
+  else if (c ~ /^(java)$/)                                     { IC = I_java;    CC = C_orange }
+  else if (c ~ /^(ruby|irb|rails)$/)                           { IC = I_ruby;    CC = C_orange }
+  else if (c ~ /^(php|composer)$/)                             { IC = I_php;     CC = C_lack }
+  else if (c ~ /^(kubectl|k9s)$/)                              { IC = I_k8s;     CC = C_blue }
+  else if (c ~ /^(yazi|lf|ranger|nnn)$/)                       { IC = I_files;   CC = C_yellow }
+  if (!ICONS) IC = "" }
+'
+
+state() { cat $TA_STATE/$1 2>/dev/null }
+setstate() { print -rn -- "$2" > $TA_STATE/$1 }
+flash() { setstate flash "$1" }
+cur_session() { state cur_sid }
+
+# ── list ─────────────────────────────────────────────────────────────────────
+# rows: kind \t target-id \t session-id \t pretty display (field 4 on is shown; its
+# GAP-separated columns are what --nth searches)
+list_width() {  # columns available to a list row, mirroring the --preview-window rule
+  local cols=${FZF_COLUMNS:-${COLUMNS:-$(tput cols 2>/dev/null || print 120)}}
+  local pw=$(( cols * 52 / 100 ))
+  [[ -e $TA_STATE/nopreview ]] && pw=0
+  (( pw >= 64 )) && print $(( cols - pw - 8 )) || print $(( cols - 8 ))
+}
+
+list() {
+  local view=$(state view)
+  # most recently visited first (@ta_visit, set by tmux.conf hooks), then most recent output
+  tmux list-windows -a -F $'#{window_id}\t#{session_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_current_command}\t#{pane_current_path}\t#{window_activity}\t#{session_attached}\t#{window_active}\t#{window_panes}\t#{window_zoomed_flag}\t#{window_bell_flag}\t#{@ta_visit}' 2>/dev/null \
+  | sort -t $'\t' -k14,14nr -k8,8nr \
+  | LC_ALL=C awk -F '\t' "${AWKV[@]}" -v view="${view:-windows}" -v width=$(list_width) -v cur_sid="$(state cur_sid)" -v cur_wid="$(state cur_wid)" "$AWKLIB"'
+  {
+    if ($5 == $6) { cmd($6); $5 = CN }   # auto-named windows: show "claude", not "2.1.282"
+    n++; wid[n]=$1; sid[n]=$2; sn[n]=$3; wi[n]=$4; wn[n]=$5; wc[n]=$6; wp[n]=short($7)
+    wa[n]=$8; att[n]=$9; act[n]=$10; np[n]=$11; zm[n]=$12; bell[n]=$13
+    if (vlen($3) > sw) sw = vlen($3)
+    if (!($2 in sidx)) { sidx[$2] = ++ns; so[ns] = $2; ssn[$2] = $3; satt[$2] = $9; sact[$2] = $8 }
+    swc[$2]++
+    cmd($6)
+    sdesc[$2] = sdesc[$2] (sdesc[$2] == "" ? "" : C_gray4 "  ") CC (IC == "" ? "" : IC " ") C_gray7 trunc($5, 14)
+    sdlen[$2] += (sdlen[$2] ? 2 : 0) + (IC == "" ? 0 : 2) + vlen(trunc($5, 14))
+    if ($10 == 1) spath[$2] = short($7)
+  }
+  function dot(a) { return a > 0 ? C_green "●" : C_gray5 "○" }
+  function windows(  i, nw, cw, pw, fw, flags, fl, line, age, cur) {
+    for (i = 1; i <= n; i++) { cmd(wc[i])
+      if (vlen(wn[i]) > nw) nw = vlen(wn[i]); if (vlen(CN) > cw) cw = vlen(CN); if (vlen(wp[i]) > pw) pw = vlen(wp[i]) }
+    if (sw > 16) sw = 16; if (nw > 20) nw = 20; if (cw > 10) cw = 10; if (pw > 32) pw = 32
+    fixed = 2 + sw + 4 + 2 + nw + 2 + (ICONS ? 2 : 0) + cw + 2 + 6 + 5
+    if (fixed + pw + 2 > width) pw = width - fixed - 2
+    if (pw < 8) { pw = 0; nw = nw > 14 ? 14 : nw; sw = sw > 10 ? 10 : sw }
+    for (i = 1; i <= n; i++) if (wid[i] != cur_wid) row(i, nw, cw, pw)
+    for (i = 1; i <= n; i++) if (wid[i] == cur_wid) row(i, nw, cw, pw)
+  }
+  function row(i, nw, cw, pw,   flags, age) {
+    cmd(wc[i])
+    flags = ""
+    if (np[i] > 1) flags = flags C_gray6 (ICONS ? I_panes " " : "▦") np[i] " "
+    if (zm[i]) flags = flags C_lack (ICONS ? I_zoom " " : "Z ")
+    if (bell[i]) flags = flags C_red (ICONS ? I_bell " " : "! ")
+    age = wid[i] == cur_wid ? C_green B "here" R : C_gray5 lpad(ago(wa[i]), 4)
+    # columns: 1 session · 2 index · 3 window · 4 command · [5 path] · age+flags (--nth=1,3,4)
+    printf "w\t%s\t%s\t%s %s%s%s" G "%s%2s%s" G "%s%s%s" G "%s%s%s%s" G "%s%s%s%s%s  %s%s\n", wid[i], sid[i],
+      dot(att[i]), B scol(sn[i]), pad(trunc(sn[i], sw), sw), R,
+      C_gray5, wi[i], R,
+      (act[i] ? C_fg B : C_gray8), pad(trunc(wn[i], nw), nw), R,
+      CC, (IC == "" ? "" : IC " "), pad(trunc(CN, cw), cw), R,
+      C_gray6, (pw ? pad(ltrunc(wp[i], pw), pw) G : ""), R,
+      age, R, flags, R
+  }
+  function sessions(  j, s, pw, dw) {
+    if (sw > 18) sw = 18
+    for (j = 1; j <= ns; j++) { s = so[j]; if (vlen(spath[s]) > pw) pw = vlen(spath[s]) }
+    if (pw > 28) pw = 28
+    if (2 + sw + 10 + pw + 8 + 20 > width) pw = width - sw - 40
+    if (pw < 8) pw = 0
+    for (j = 1; j <= ns; j++) if (so[j] != cur_sid) srow(so[j], pw)
+    for (j = 1; j <= ns; j++) if (so[j] == cur_sid) srow(so[j], pw)
+  }
+  function srow(s, pw,   age) {
+    age = s == cur_sid ? C_green B "here" R : C_gray5 lpad(ago(sact[s]), 4)
+    # columns: 1 session · 2 count · [3 path] · age · last: its windows (--nth=1,-1)
+    printf "s\t%s\t%s\t%s %s%s%s" G "%s%2d win%s" G "%s%s%s%s" G "%s%s\n", s, s,
+      dot(satt[s]), B scol(ssn[s]), pad(trunc(ssn[s], sw), sw), R,
+      C_gray6, swc[s], R,
+      C_gray6, (pw ? pad(ltrunc(spath[s], pw), pw) G : ""), R,
+      age, sdesc[s], R
+  }
+  END { if (view == "sessions") sessions(); else windows() }'
+}
+
+# ── preview ──────────────────────────────────────────────────────────────────
+fit() {  # clip ANSI text to $1 columns × $2 lines without breaking escapes
+  LC_ALL=C awk -v cols="$1" -v max="$2" '
+    BEGIN { esc = sprintf("%c", 27); re = "^" esc "\\[[0-9;?]*[ -/]*[@-~]"; for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i }
+    NR > max { exit }
+    { o = ""; v = 0; r = $0
+      while (length(r) > 0 && v < cols) {
+        if (match(r, re)) { o = o substr(r, 1, RLENGTH); r = substr(r, RLENGTH + 1); continue }
+        if (substr(r, 1, 1) == esc) { r = substr(r, 2); continue }
+        ch = substr(r, 1, 1); r = substr(r, 2); o = o ch
+        c = ORD[ch]; if (c >= 128 && c < 192) continue
+        v += (ch == "\t") ? 8 - v % 8 : 1 }
+      print o esc "[0m" }'
+}
+
+rule() { print -r -- "${C[gray3]}${(pl:$1::─:)}$R" }
+
+# draws the window's pane layout as a scaled map, active pane highlighted
+layout_map() {
+  local target=$1 cols=$2
+  tmux list-panes -t $target -F $'#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{pane_current_command}\t#{window_width}\t#{window_height}' 2>/dev/null \
+  | LC_ALL=C awk -F '\t' "${AWKV[@]}" -v cols=$cols "$AWKLIB"'
+    { n++; L[n]=$1; T[n]=$2; W[n]=$3; H[n]=$4; A[n]=$5; X[n]=$6; ww=$7; wh=$8 }
+    function put(x, y, c, col) { G[y, x] = c; K[y, x] = col }
+    function box(i, col,   x0, x1, y0, y1, x, y, lab) {
+      x0 = int(L[i] * gw / (ww + 1) + .5); x1 = int((L[i] + W[i] + 1) * gw / (ww + 1) + .5) - 1
+      y0 = int(T[i] * gh / (wh + 1) + .5); y1 = int((T[i] + H[i] + 1) * gh / (wh + 1) + .5) - 1
+      if (x1 <= x0) x1 = x0 + 1; if (y1 <= y0) y1 = y0 + 1
+      for (x = x0 + 1; x < x1; x++) { put(x, y0, "─", col); put(x, y1, "─", col) }
+      for (y = y0 + 1; y < y1; y++) { put(x0, y, "│", col); put(x1, y, "│", col) }
+      put(x0, y0, "╭", col); put(x1, y0, "╮", col); put(x0, y1, "╰", col); put(x1, y1, "╯", col)
+      if (y1 - y0 >= 2 && x1 - x0 >= 4) { cmd(X[i]); lab = trunc((IC == "" ? "" : IC " ") CN, x1 - x0 - 3)
+        cy = int((y0 + y1) / 2); LB[cy, x0 + 2] = (A[i] ? C_fg B : C_gray6) lab R; LS[cy, x0 + 2] = vlen(lab) }
+    }
+    END {
+      gw = cols - 2; if (gw > 56) gw = 56
+      gh = int(gw * wh / ww / 2.1 + .5); if (gh < 5) gh = 5; if (gh > 11) gh = 11
+      for (i = 1; i <= n; i++) if (!A[i]) box(i, C_gray4)
+      for (i = 1; i <= n; i++) if (A[i]) box(i, C_accent)
+      for (y = 0; y < gh; y++) { line = " "
+        for (x = 0; x < gw; x++) {
+          if ((y, x) in LB) { line = line LB[y, x]; x += LS[y, x] - 1; continue }
+          line = line (((y, x) in G) ? K[y, x] G[y, x] R : " ") }
+        print line }
+    }'
+}
+
+capture() {  # capture the active pane of $1: whole screen for fullscreen apps, else tail of output
+  local target=$1 cols=$2 lines=$3 alt=$4 out
+  (( lines < 1 )) && return
+  if [[ $alt == 1 ]]; then
+    out=$(tmux capture-pane -epJ -t $target 2>/dev/null | tr -d '\000')
+  else
+    out=$(tmux capture-pane -epJ -S -300 -t $target 2>/dev/null | tr -d '\000' \
+          | awk '{ l[NR] = $0; t = $0; gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", t) } t ~ /[^[:space:]]/ { last = NR } END { for (i = 1; i <= last; i++) print l[i] }' \
+          | tail -n $lines)
+  fi
+  if [[ $out == *[^[:space:]]* ]]; then
+    print -r -- "$out" | fit $cols $lines
+  else
+    print -r -- $'\n'"${C[gray5]}${IT}   nothing on screen yet$R"
+  fi
+}
+
+git_info() {
+  local dir=$1 br dirty
+  br=$(git -C $dir symbolic-ref --short -q HEAD 2>/dev/null || git -C $dir rev-parse --short HEAD 2>/dev/null) || return
+  [[ -z $br ]] && return
+  dirty=$(git -C $dir status --porcelain -uno --ignore-submodules 2>/dev/null | wc -l | tr -d ' ')
+  print -rn -- "   ${C[orange]}$(ic branch)$br$R"
+  (( dirty > 0 )) && print -rn -- " ${C[yellow]}±$dirty$R"
+}
+
+preview() {
+  local kind=$1 id=$2 cols=${FZF_PREVIEW_COLUMNS:-80} lines=${FZF_PREVIEW_LINES:-40}
+  [[ -z $id ]] && return
+  local -a f
+  f=("${(@ps:\t:)$(tmux display-message -p -t $id $'#{session_name}\t#{window_index}\t#{window_name}\t#{window_panes}\t#{window_width}\t#{window_height}\t#{window_activity}\t#{window_zoomed_flag}\t#{pane_current_command}\t#{pane_current_path}\t#{alternate_on}\t#{window_id}\t#{session_windows}\t#{session_attached}\t#{session_created}' 2>/dev/null)}")
+  (( ${#f} < 15 )) && { print -r -- "${C[red]}  gone — ctrl-r to refresh$R"; return }
+  local sname=$f[1] widx=$f[2] wname=$f[3] panes=$f[4] ww=$f[5] wh=$f[6] act=$f[7] zoom=$f[8]
+  [[ $wname == $f[9] && $wname =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && wname=claude
+  local pcmd=$f[9] ppath=$f[10] alt=$f[11] wid=$f[12] nwin=$f[13] attached=$f[14] created=$f[15]
+  local meta used
+  meta=$(print -r -- "$sname	$pcmd	$ppath	$act	$created" | LC_ALL=C awk -F '\t' "${AWKV[@]}" "$AWKLIB"'
+    { cmd($2); printf "%s\t%s%s%s%s\t%s\t%s\t%s\n", scol($1), CC, (IC == "" ? "" : IC " "), CN, R, short($3), ago($4), ago($5) }')
+  local -a m; m=("${(@ps:\t:)meta}")
+  local sc=$m[1] cmdfmt=$m[2] spath=$m[3] actago=$m[4] crago=$m[5]
+  [[ $actago != now ]] && actago="$actago ago"
+
+  if [[ $kind == s ]]; then
+    print -r -- " ${sc}${B}${sname}$R  ${C[gray6]}$nwin window$([[ $nwin != 1 ]] && print s)$R$([[ $attached -gt 0 ]] && print -r -- "  ${C[green]}● attached$R")"
+    print -r -- " ${C[gray5]}created $crago ago · active $actago$R"
+    rule $cols
+    tmux list-windows -t $id -F $'#{window_active}\t#{window_index}\t#{window_name}\t#{pane_current_command}\t#{pane_current_path}\t#{window_panes}' 2>/dev/null \
+    | LC_ALL=C awk -F '\t' "${AWKV[@]}" -v cols=$cols "$AWKLIB"'
+      { cmd($4); if ($3 == $4) $3 = CN
+        printf " %s %s%2s%s  %s%s%s  %s%s%s  %s%s%s\n", ($1 ? C_accent "▌" : " "), C_gray5, $2, R,
+          ($1 ? C_fg B : C_gray8), pad(trunc($3, 16), 16), R, CC, (IC == "" ? "" : IC " "), pad(trunc(CN, 9), 9), R,
+          C_gray6, ltrunc(short($5), cols - 40 > 8 ? cols - 40 : 8), R }' | head -n 12
+    used=$(( 3 + (nwin > 12 ? 12 : nwin) ))
+    rule $cols; used=$((used + 1))
+    print -r -- " ${C[gray5]}active window ${C[gray7]}$widx $wname$R  $cmdfmt"
+    used=$((used + 1))
+  else
+    print -r -- " ${sc}${B}${sname}$R ${C[gray4]}›$R ${C[gray5]}$widx$R ${C[fg]}${B}$wname$R$([[ $zoom == 1 ]] && print -r -- "  ${C[lack]}$(ic zoom)zoomed$R")"
+    print -r -- " $cmdfmt   ${C[gray6]}$(ic folder)$spath$R$(git_info $ppath)"
+    print -r -- " ${C[gray5]}$panes pane$([[ $panes != 1 ]] && print s) · ${ww}×${wh} · active $actago$R"
+    used=3
+    if (( panes > 1 && lines > 24 )); then
+      local map=$(layout_map $wid $cols)
+      rule $cols; print -r -- "$map"
+      used=$(( used + 1 + ${#${(f)map}} ))
+    fi
+  fi
+  rule $cols
+  capture $wid $cols $(( lines - used - 1 )) $alt
+}
+
+# ── header / actions (called by fzf binds; stdout = fzf actions) ─────────────
+header() {
+  local msg=$(state flash)
+  if [[ -n $msg ]]; then rm -f $TA_STATE/flash; print -r -- "$msg"; return; fi
+  if [[ $(state mode) == rename ]]; then
+    print -r -- "${C[accent]}$(ic pencil)renaming — ${C[fg]}↵ save  ${C[gray6]}esc cancel$R"; return
+  fi
+  if (( ${FZF_MATCH_COUNT:-1} == 0 )) && [[ -n $FZF_QUERY ]]; then
+    print -r -- "${C[green]}$(ic plus)↵ create session ${B}$(sanitize "$FZF_QUERY")$R${C[gray6]}  — pick its directory next$R"; return
+  fi
+  local -a sids; sids=(${(f)"$(tmux list-windows -a -F '#{session_id}' 2>/dev/null)"})
+  local nw=${#sids} ns=${#${(u)sids}} hint=
+  [[ -n $FZF_QUERY ]] && hint="   ${C[gray4]}·   ${C[accent]}⌥↵ ${C[gray6]}new session ${C[gray8]}$(sanitize "$FZF_QUERY")"
+  if (( ns == 0 )); then
+    print -r -- "${C[gray6]}no sessions yet — type a name and press ${C[green]}↵$C[gray6] to create one$R"
+  else
+    print -r -- "${C[gray6]}$ns session${${ns:#1}:+s} · $nw window${${nw:#1}:+s}$hint$R"
+  fi
+}
+
+sanitize() { local n=${1//[.:]/_}; n=${n##[[:space:]]#}; print -r -- ${n%%[[:space:]]#} }
+
+restore() {  # back to the mode you renamed from, with the query you had before
+  local m=insert
+  if [[ -e $TA_STATE/was_normal ]]; then
+    m=normal; rm -f $TA_STATE/was_normal; touch $TA_STATE/normal
+  else
+    rm -f $TA_STATE/normal
+  fi
+  print -rn -- "enable-search+change-prompt($(state prompt_$m))+change-input-label($(state label_$m))+change-footer($(state footer_$m))+transform-header($S __header)+change-query:$(state saved_query)"
+}
+
+on_enter() {
+  local kind=$1 id=$2
+  if [[ $(state mode) == rename ]]; then
+    local rk=$(state rename_kind) rid=$(state rename_id) name=$FZF_QUERY
+    rm -f $TA_STATE/mode
+    if [[ -n $name ]]; then
+      [[ $rk == s ]] && name=$(sanitize "$name")
+      if [[ $rk == s ]]; then tmux rename-session -t $rid -- "$name"; else tmux rename-window -t $rid -- "$name"; fi \
+        && flash "${C[green]}$(ic check)renamed to ${B}$name$R" \
+        || flash "${C[red]}$(ic warn)rename failed$R"
+    fi
+    print -rn -- "reload($S __list)+"; restore; return
+  fi
+  if (( FZF_MATCH_COUNT == 0 )); then
+    [[ -n $FZF_QUERY ]] && print -rn -- "become:$S __new {q}"
+    return
+  fi
+  print -rn -- accept
+}
+
+on_esc() {
+  if [[ $(state mode) == rename ]]; then
+    rm -f $TA_STATE/mode; flash "${C[gray6]}rename cancelled$R"; restore
+  else
+    print -rn -- abort
+  fi
+}
+
+on_tab() {
+  [[ $(state mode) == rename ]] && return
+  if [[ $(state view) == sessions ]]; then
+    setstate view windows
+    print -rn -- "change-list-label( $(ic windows)windows )+change-nth(1,3,4)+reload($S __list)+first"
+  else
+    setstate view sessions
+    print -rn -- "change-list-label( $(ic sessions)sessions )+change-nth(1,-1)+reload($S __list)+first"
+  fi
+}
+
+on_toggle_preview() {  # the list is laid out for the preview's width, so re-render it too
+  if [[ -e $TA_STATE/nopreview ]]; then rm -f $TA_STATE/nopreview; else touch $TA_STATE/nopreview; fi
+  print -rn -- "toggle-preview+reload($S __list)"
+}
+
+on_rename() {
+  local kind=$1 id=$2
+  [[ -z $id || $(state mode) == rename ]] && return
+  local cur label
+  if [[ $kind == s ]]; then
+    cur=$(tmux display-message -p -t $id '#{session_name}'); label="session"
+  else
+    cur=$(tmux display-message -p -t $id '#{window_name}'); label="window"
+  fi
+  setstate mode rename; setstate rename_kind $kind; setstate rename_id $id; setstate saved_query "$FZF_QUERY"
+  print -rn -- "disable-search+change-prompt(${IC[pencil]:+${IC[pencil]} }rename $label ❯ )+transform-header($S __header)+change-query:$cur"
+}
+
+on_kill() {  # $1 = window|session|auto
+  local what=$1 kind=$2 id=$3 sid=$4
+  [[ -z $id || $(state mode) == rename ]] && return
+  [[ $what == auto ]] && { [[ $kind == s ]] && what=session || what=window }
+  if [[ $what == window ]]; then
+    [[ $kind == s ]] && id=$(tmux display-message -p -t $id '#{window_id}')
+    local name=$(tmux display-message -p -t $id '#{session_name}:#{window_index} #{window_name}')
+    tmux kill-window -t $id && flash "${C[red]}$(ic trash)killed window ${B}$name$R"
+    rm -f $TA_STATE/pending
+    print -rn -- "reload($S __list)"
+    return
+  fi
+  local name=$(tmux display-message -p -t $sid '#{session_name}') n=$(tmux display-message -p -t $sid '#{session_windows}')
+  if [[ $(state pending) == $sid ]]; then
+    rm -f $TA_STATE/pending
+    tmux kill-session -t $sid && flash "${C[red]}$(ic trash)killed session ${B}$name$R"
+    print -rn -- "reload($S __list)"
+  else
+    setstate pending $sid
+    print -rn -- "change-header:${C[red]}${B}$(ic warn)kill session $name ($n window$( ((n != 1)) && print s))?$R${C[red]}  press again to confirm$R"
+  fi
+}
+
+on_focus() {  # moving the cursor cancels a pending kill confirmation
+  [[ -f $TA_STATE/pending ]] || return
+  rm -f $TA_STATE/pending
+  print -rn -- "transform-header($S __header)"
+}
+
+on_new_window() {
+  local kind=$1 id=$2 sid=$3
+  [[ -z $id || $(state mode) == rename ]] && return
+  local dir=$(tmux display-message -p -t $id '#{pane_current_path}')
+  local nwid=$(tmux new-window -d -P -F '#{window_id}' -t "$sid:" -c "${dir:-$HOME}")
+  [[ -n $nwid ]] && print -rn -- "become:$S __go w $nwid"
+}
+
+go() {
+  local id=$2
+  [[ -z $id ]] && return 1
+  if [[ -n $TMUX ]]; then
+    tmux switch-client -t $id
+  else
+    tmux attach-session -t $id
+  fi
+}
+
+# shared fzf look (main picker + directory picker)
+THEME=(
+  --ansi --layout=reverse --style=full --border=none --margin=0,1 --no-hscroll
+  --pointer='▌' --marker='┃' --gutter=' ' --info=inline-right --highlight-line --no-scrollbar
+  --header-border=none --footer-border=none
+  --color="fg:#${HEX[gray7]},fg+:#${HEX[fg]},bg:-1,bg+:#${HEX[gray2]},gutter:-1"
+  --color="hl:#${HEX[fg]}:bold:underline,hl+:#${HEX[fg]}:bold:underline"
+  --color="prompt:#${HEX[accent]},pointer:#${HEX[accent]},marker:#${HEX[accent]},info:#${HEX[gray5]},spinner:#${HEX[gray6]}"
+  --color="border:#${HEX[gray3]},list-border:#${HEX[gray3]},input-border:#${HEX[gray4]},preview-border:#${HEX[gray3]},separator:#${HEX[gray3]}"
+  --color="label:#${HEX[gray6]},input-label:#${HEX[gray8]}:bold,list-label:#${HEX[gray6]},query:#${HEX[fg]}:bold,ghost:#${HEX[gray4]}:italic"
+  --color="header:#${HEX[gray6]},footer:#${HEX[gray5]}"
+)
+
+footer() {  # footer() key label key label …
+  local out=" " sep=""
+  while (( $# >= 2 )); do out+="$sep${C[accent]}$1${C[gray6]} $2"; sep="${C[gray4]} · "; shift 2; done
+  print -r -- "$out$R"
+}
+
+# directory picker: the current dir first, then zoxide's most-used dirs → prints the chosen path
+pick_dir() {
+  local label=$1 cwd=${TA_CWD:-$PWD}
+  { print -r -- $cwd; command -v zoxide >/dev/null && zoxide query -l 2>/dev/null } \
+  | awk -F '\t' "${AWKV[@]}" -v cwd="$cwd" '!seen[$0]++ {
+      d = $0; if (index(d, HOME) == 1) d = "~" substr(d, length(HOME) + 1)
+      n = split(d, p, "/"); base = p[n]; parent = substr(d, 1, length(d) - length(base))
+      printf "%s\t%s%s%s%s%s%s\n", $0, C_gray6, parent, C_fg B, base, R, ($0 == cwd ? "  " C_green "● here" R : "") }' \
+  | fzf "${THEME[@]}" --delimiter=$'\t' --with-nth=2 --accept-nth=1 --scheme=path --tiebreak=index \
+      --prompt="${IC[folder]:+${IC[folder]} }❯ " --input-label=" $label " --list-label=" directories " \
+      --ghost='search your zoxide directories' \
+      --footer="$(footer ↵ 'start here' esc back)" \
+      --preview="$S __dirpreview {1}" --preview-window='right,52%,<64(down,50%)'
+}
+
+dir_preview() {
+  local dir=$1 cols=${FZF_PREVIEW_COLUMNS:-80}
+  print -r -- " ${C[fg]}${B}${dir:t}$R  ${C[gray6]}${dir/#$HOME/~}$R$(git_info $dir)"
+  rule $cols
+  if command -v eza >/dev/null; then
+    eza --tree --level=2 --icons=always --color=always --group-directories-first --git-ignore -- "$dir" 2>/dev/null | tail -n +2 | head -n 200
+  else
+    ls -1 -- "$dir"
+  fi
+}
+
+new_session() {  # $1 name, $2 dir (asked for when empty)
+  local name=$(sanitize "$1") dir=$2
+  [[ -z $name ]] && return 1
+  if [[ -n $dir ]]; then  # same folder name, different project (~/work/api vs ~/oss/api) → "work-api"
+    local spath=$(tmux display-message -p -t "=$name:" '#{session_path}' 2>/dev/null)
+    [[ -n $spath && ${spath:A} != ${dir:A} ]] && name=$(sanitize "${dir:A:h:t}-${dir:t}")
+  fi
+  if tmux has-session -t "=$name" 2>/dev/null; then go s "=$name"; return; fi
+  if [[ -z $dir ]]; then
+    dir=$(pick_dir "new session · $name") || exec $SELF   # esc → back to the main list
+  fi
+  [[ -d $dir ]] || dir=${TA_CWD:-$PWD}
+  if [[ -n $TMUX ]]; then
+    tmux new-session -d -s "$name" -c "$dir" && tmux switch-client -t "=$name"
+  else
+    tmux new-session -s "$name" -c "$dir"
+  fi
+}
+
+# ctrl-f: pick a project directory → open (or create) the session named after it
+open_project() {
+  local dir
+  dir=$(pick_dir "open project") || exec $SELF
+  [[ -n $dir ]] && new_session "${dir:t}" "$dir"
+}
+
+# ── picker ───────────────────────────────────────────────────────────────────
+main() {
+  command -v tmux >/dev/null || { print -u2 "ta: tmux not found"; return 1 }
+  command -v fzf  >/dev/null || { print -u2 "ta: fzf not found";  return 1 }
+  # coming back via `exec $SELF` (esc in the dir picker): drop the old fzf's per-run vars
+  unset FZF_QUERY FZF_MATCH_COUNT FZF_PORT FZF_ACTION FZF_KEY
+
+  # inside tmux: float in a popup over the current window
+  if [[ -n $TMUX && -z $TA_IN_POPUP && ${TA_POPUP:-1} != 0 ]]; then
+    tmux display-popup -E -B -w 90% -h 86% -d "$PWD" \
+      -e TA_IN_POPUP=1 -e "TA_CWD=$PWD" -e "TA_ICONS=$ICONS" \
+      -e "TA_CUR=$(tmux display-message -p ${TMUX_PANE:+-t} ${TMUX_PANE:+$TMUX_PANE} '#{session_id} #{window_id}')" \
+      "$S ${(q)*}"
+    return
+  fi
+
+  export TA_STATE=$(mktemp -d "${TMPDIR:-/tmp}/ta.XXXXXX") TA_CWD=${TA_CWD:-$PWD}
+  # fzf's --listen port accepts actions (incl. running commands) → require a key
+  export FZF_API_KEY=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+  trap 'rm -rf $TA_STATE' EXIT INT TERM
+  if [[ -n $TMUX ]]; then
+    local ids=${TA_CUR:-$(tmux display-message -p ${TMUX_PANE:+-t} ${TMUX_PANE:+$TMUX_PANE} '#{session_id} #{window_id}')}
+    setstate cur_sid ${ids% *}; setstate cur_wid ${ids#* }
+  fi
+  setstate view windows
+
+  local keys=(↵ open ⌥↵ 'new session' jk normal ^f project ⇥ sessions/windows ^e rename ^o 'new window' ^x kill ^/ preview)
+  setstate prompt_insert "${IC[tmux]:+${IC[tmux]} }❯ "
+  setstate prompt_normal "$B${C[bg]}$(printf '\e[48;2;204;204;204m') NOR $R ${C[gray6]}❯$R "
+  setstate label_insert " ta "
+  setstate label_normal " ta · normal "
+  setstate footer_insert "$(footer $keys)"
+  setstate footer_normal "$(footer j/k move gg/G 'top/bottom' ↵ open i search r rename o 'new window' 'dd/x' kill f project q quit)"
+  # start in normal mode (j/k move, i to search); a query on the command line means search
+  local start=normal
+  [[ -n $* ]] && start=insert
+  [[ $start == normal ]] && touch $TA_STATE/normal
+  local -a modal
+  # every key that types (or submits) goes through __key: modes + the held `j` live there
+  for key in {a..z} {A..Z} {0..9} / - _ . space bspace ctrl-d ctrl-u enter alt-enter tab; do
+    modal+=(--bind "${key}:transform($S __key $key)")
+  done
+
+  local sel
+  sel=$(list | fzf \
+    "${THEME[@]}" --delimiter=$'\t|'$NB --with-nth=4.. --nth=1,3,4 --tiebreak=index \
+    --query="$*" ${1:+--select-1} \
+    --prompt="$(state prompt_$start)" \
+    --ghost='search · or type a new name to create a session' \
+    --input-label="$(state label_$start)" --list-label=" $(ic windows)windows " \
+    --footer="$(state footer_$start)" --header="$(header)" \
+    --with-shell='/bin/sh -c' --listen=127.0.0.1:0 "${modal[@]}" \
+    --preview="$S __preview {1} {2}" \
+    --preview-window='right,52%,<64(down,55%)' \
+    --bind "esc:transform:$S __esc" \
+    --bind "ctrl-e:transform:$S __rename {1} {2}" --bind "alt-r:transform:$S __rename {1} {2}" \
+    --bind "ctrl-o:transform:$S __new-window {1} {2} {3}" --bind "alt-n:transform:$S __new-window {1} {2} {3}" \
+    --bind "ctrl-x:transform:$S __kill auto {1} {2} {3}" \
+    --bind "alt-k:transform:$S __kill window {1} {2} {3}" \
+    --bind "alt-x:transform:$S __kill session {1} {2} {3}" \
+    --bind "ctrl-r:reload($S __list)" \
+    --bind "ctrl-/:transform:$S __toggle-preview" \
+    --bind "resize:reload($S __list)" \
+    --bind "ctrl-f:become:$S __project" \
+    --bind "focus:transform:$S __focus" \
+    --bind "result:bg-cancel+bg-transform-header:$S __header" \
+  ) || return 0
+
+  local -a f; f=("${(@ps:\t:)sel}")
+  go $f[1] $f[2]
+}
+
+case $1 in
+  __list)       list ;;
+  __preview)    preview $2 $3 ;;
+  __header)     header ;;
+  __enter)      on_enter $2 $3 ;;
+  __esc)        on_esc ;;
+  __tab)        on_tab ;;
+  __toggle-preview) on_toggle_preview ;;
+  __rename)     on_rename $2 $3 ;;
+  __kill)       on_kill $2 $3 $4 $5 ;;
+  __focus)      on_focus ;;
+  __new-window) on_new_window $2 $3 $4 ;;
+  __go)         go $2 $3 ;;
+  __new)        new_session "$2" ;;
+  __project)    open_project ;;
+  __dirpreview) dir_preview "$2" ;;
+  *)            main "$@" ;;
+esac
