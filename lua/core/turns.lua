@@ -12,6 +12,10 @@ local M = {}
 
 M.ref = "refs/agent/turns"
 local START_REF = "refs/agent/start/"
+-- Snapshot of the tree the last time the agent was told about your edits
+local TOLD_REF = "refs/agent/told"
+-- One ref per reverted turn, so undo walks back instead of repeating itself
+local UNDONE_REF = "refs/agent/undone/"
 
 local identity = {
 	GIT_AUTHOR_NAME = "agent-turns",
@@ -105,7 +109,37 @@ function M.start(root, session, prompt)
 	end
 end
 
---- Recorded turns, newest first: { id, start, time, subject, stat }
+--- Record that the agent now knows the working tree as it is (tree: M.tree())
+function M.mark_told(root, tree)
+	tree = tree or M.tree(root)
+	local id = tree and commit(root, tree, nil, "told")
+	if id then
+		M.git(root, { "update-ref", TOLD_REF, id })
+	end
+end
+
+--- The last tree the agent saw: the newer of its last turn's end and the
+--- last mark_told(). nil when neither exists.
+function M.baseline(root)
+	local turn = M.list(root, 1)[1]
+	local told = M.git(root, { "log", "-1", "--format=%H %ct", TOLD_REF })
+	local told_id, told_time = (told or ""):match("^(%x+) (%d+)$")
+	if told_id and (not turn or tonumber(told_time) >= turn.time) then
+		return told_id
+	end
+	return turn and turn.id
+end
+
+local function undone_set(root)
+	local out = M.git(root, { "for-each-ref", "--format=%(objectname)", UNDONE_REF })
+	local set = {}
+	for id in (out or ""):gmatch("%x+") do
+		set[id] = true
+	end
+	return set
+end
+
+--- Recorded turns, newest first: { id, start, time, subject, stat, undone }
 function M.list(root, limit)
 	local out = M.git(root, {
 		"log",
@@ -118,6 +152,7 @@ function M.list(root, limit)
 		M.ref,
 	})
 	local turns = {}
+	local undone = undone_set(root)
 	for record in (out or ""):gmatch("\30([^\30]+)") do
 		local head, stat = record:match("^([^\n]*)\n?(.*)$")
 		local id, start, time, subject = head:match("^(%x+)\t(%x*)\t(%d+)\t(.*)$")
@@ -128,6 +163,7 @@ function M.list(root, limit)
 				time = tonumber(time),
 				subject = subject,
 				stat = vim.trim(stat or ""),
+				undone = undone[id] or false,
 			})
 		end
 	end
@@ -199,6 +235,11 @@ function M.undo(turn, root)
 		vim.notify("That turn changed nothing", vim.log.levels.WARN)
 		return
 	end
+	if require("core.bridge").busy()
+		and vim.fn.confirm("The agent is mid-turn and may be editing these files. Revert anyway?", "&Revert\n&Cancel", 2) ~= 1
+	then
+		return
+	end
 
 	for _, path in ipairs(files) do
 		local buf = vim.fn.bufnr(root .. "/" .. path)
@@ -241,6 +282,9 @@ function M.undo(turn, root)
 		end
 	end
 	vim.cmd("checktime")
+	M.git(root, { "update-ref", UNDONE_REF .. turn.id, turn.id })
+	-- The revert gets its own message below; keep it out of <leader>ae's diff
+	M.mark_told(root)
 	vim.notify(("Reverted turn \"%s\" (%d files)"):format(turn.subject, #files))
 
 	-- Tell the agent, or it will happily redo it
@@ -259,10 +303,26 @@ function M.undo(turn, root)
 	end)
 end
 
+--- Revert the newest turn not reverted yet; repeat to walk further back
 function M.undo_last()
 	local root = current_root()
-	local turn = root and latest(root)
-	if turn and vim.fn.confirm(("Revert agent turn \"%s\"?\n%s"):format(turn.subject, turn.stat), "&Revert\n&Cancel", 2) == 1 then
+	if not root then
+		return
+	end
+	local turn
+	for _, t in ipairs(M.list(root)) do
+		if not t.undone then
+			turn = t
+			break
+		end
+	end
+	if not turn then
+		if latest(root) then
+			vim.notify("Every recorded turn is already reverted", vim.log.levels.WARN)
+		end
+		return
+	end
+	if vim.fn.confirm(("Revert agent turn \"%s\"?\n%s"):format(turn.subject, turn.stat), "&Revert\n&Cancel", 2) == 1 then
 		M.undo(turn, root)
 	end
 end
@@ -294,7 +354,7 @@ function M.pick()
 					local files = turn.stat:match("^(%d+) files? changed") or "0"
 					return {
 						value = turn,
-						display = ("%-8s %3s files  %s"):format(ago(turn.time), files, turn.subject),
+						display = ("%-8s %3s files  %s%s"):format(ago(turn.time), files, turn.undone and "(reverted) " or "", turn.subject),
 						ordinal = turn.subject,
 					}
 				end,

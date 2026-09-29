@@ -10,18 +10,20 @@ M.templates = {
 	{ "Plan first", "Before changing anything, explain what's going on and propose a plan. Wait for my OK." },
 	{ "Tests first", "Write a failing test for this first and show it fails, then make it pass." },
 	{ "Review only", "Review this for bugs and risky assumptions. List issues by severity; don't change code yet." },
-	{ "Match the codebase", "Follow the patterns and style of the surrounding code; reuse existing helpers instead of adding new ones." },
-	{ "Verify", "When done, run the relevant tests/linters and show me the result. Don't claim it works without running it." },
+	{
+		"Match the codebase",
+		"Follow the patterns and style of the surrounding code; reuse existing helpers instead of adding new ones.",
+	},
+	{
+		"Verify",
+		"When done, run the relevant tests/linters and show me the result. Don't claim it works without running it.",
+	},
 }
 
 local win
 
 local function path()
-	local cwd = vim.fn.getcwd()
-	local root = vim.fs.root(cwd, ".git") or cwd
-	local dir = vim.fn.stdpath("state") .. "/agent-prompts"
-	vim.fn.mkdir(dir, "p")
-	return dir .. "/" .. root:gsub("[/\\:]", "%%") .. ".md"
+	return require("core.agent").state_file("agent-prompts", ".md")
 end
 
 local function buffer()

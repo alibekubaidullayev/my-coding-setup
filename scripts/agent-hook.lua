@@ -54,7 +54,8 @@ local function main()
 	local turns = require("core.turns")
 	local root = turns.root(cwd)
 
-	local payload = { event = event, agent = agent, session = session, cwd = cwd }
+	-- The agent's own tmux pane (inherited), so nvim pastes into it and nothing else
+	local payload = { event = event, agent = agent, session = session, cwd = cwd, pane = vim.env.TMUX_PANE }
 	if event == "UserPromptSubmit" then
 		payload.prompt = data.prompt
 		if root then

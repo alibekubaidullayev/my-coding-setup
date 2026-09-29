@@ -2,13 +2,55 @@
 -- selections while going through a diff (they stay visible in the buffer),
 -- reject hunks with a reason, then submit everything as one message together
 -- with the prompt draft (core/prompt.lua). Works in plain buffers and in
--- CodeDiff's revision panes.
+-- CodeDiff's revision panes. Kept on disk per repository, like the draft.
 local M = {}
 
 local ns = vim.api.nvim_create_namespace("agent-comments")
+local agent = require("core.agent")
 
 --- { key = buffer name, path, s, e, code, ft, text, general = bool }
 M.items = {}
+
+-- Fixed when the module loads, so a :cd later doesn't split the review
+local store = agent.state_file("agent-comments", ".json")
+local sent_store = agent.state_file("agent-comments", ".sent.json")
+local FIELDS = { "key", "path", "note", "s", "e", "ft", "code", "text", "general" }
+
+local function plain(items)
+	return vim.tbl_map(function(c)
+		local t = {}
+		for _, k in ipairs(FIELDS) do
+			t[k] = c[k]
+		end
+		return t
+	end, items)
+end
+
+local function write_json(file, value)
+	local f = io.open(file, "w")
+	if f then
+		f:write(vim.json.encode(value))
+		f:close()
+	end
+end
+
+local function read_json(file)
+	local f = io.open(file)
+	if not f then
+		return nil
+	end
+	local ok, value = pcall(vim.json.decode, f:read("*a"), { luanil = { object = true, array = true } })
+	f:close()
+	return ok and type(value) == "table" and value or nil
+end
+
+local function save()
+	if #M.items == 0 then
+		os.remove(store)
+	else
+		write_json(store, plain(M.items))
+	end
+end
 
 local function set_hl()
 	vim.api.nvim_set_hl(0, "AgentComment", { default = true, link = "DiagnosticVirtualTextHint" })
@@ -22,21 +64,6 @@ vim.api.nvim_create_autocmd("ColorScheme", {
 
 function M.count()
 	return #M.items
-end
-
---- Where a buffer's lines live, for the agent: repo-relative path, plus a
---- note on the revision for CodeDiff's read-only panes
-local function location(buf)
-	local name = vim.api.nvim_buf_get_name(buf)
-	if name:match("^codediff://") then
-		local ok, vf = pcall(require, "codediff.core.virtual_file")
-		local parsed = ok and { vf.parse_url(name) } or {}
-		local rev, path = parsed[2], parsed[3]
-		if path then
-			return path, rev and (rev:match("^:") and "staged version" or ("at " .. rev:sub(1, 10)))
-		end
-	end
-	return require("core.agent").relpath(buf)
 end
 
 local function render(buf)
@@ -97,19 +124,20 @@ local function range()
 	return l, l
 end
 
-local function add(buf, s, e, text, code)
-	local path, note = location(buf)
+local function add(buf, s, e, text, code, ft)
+	local path, note = agent.location(buf)
 	table.insert(M.items, {
 		key = vim.api.nvim_buf_get_name(buf),
 		path = path,
 		note = note,
 		s = s,
 		e = e,
-		ft = vim.bo[buf].filetype,
+		ft = ft or vim.bo[buf].filetype,
 		code = code or vim.api.nvim_buf_get_lines(buf, s - 1, e, false),
 		text = text,
 	})
 	render_all()
+	save()
 end
 
 --- Comment on the current line or selection
@@ -126,6 +154,7 @@ end
 --- A comment not tied to any line
 function M.add_general(text)
 	table.insert(M.items, { general = true, text = text })
+	save()
 	vim.cmd.redrawstatus()
 	vim.notify("Queued for the agent (<leader>aS to send)")
 end
@@ -180,8 +209,7 @@ function M.reject()
 		end)
 		reason = vim.trim(reason)
 		local text = "I reverted this change" .. (reason ~= "" and (": " .. reason) or ".")
-		add(buf, s, s, text, code)
-		M.items[#M.items].ft = visual and vim.bo[buf].filetype or "diff"
+		add(buf, s, s, text, code, not visual and "diff" or nil)
 	end)
 end
 
@@ -205,10 +233,12 @@ function M.delete()
 	end
 	table.remove(M.items, i)
 	render_all()
+	save()
 end
 
 function M.clear()
 	M.items = {}
+	save()
 	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
 		if vim.api.nvim_buf_is_valid(buf) then
 			vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
@@ -273,20 +303,62 @@ function M.format(draft)
 	return #out > 0 and table.concat(out, "\n\n") or nil
 end
 
---- Send prompt draft + comments to the agent pane in one go
-function M.submit()
+--- Send prompt draft + comments to the agent pane in one go.
+--- opts.comments_only: leave the draft out (and in place)
+function M.submit(opts)
+	local comments_only = opts and opts.comments_only
+	if comments_only and #M.items == 0 then
+		vim.notify("No review comments to send", vim.log.levels.WARN)
+		return
+	end
 	local prompt = require("core.prompt")
-	local text = M.format(prompt.text())
+	local draft = comments_only and "" or prompt.text()
+	local text = M.format(draft)
 	if not text then
 		vim.notify("Nothing to send: no prompt draft or review comments", vim.log.levels.WARN)
 		return
 	end
-	if require("core.agent").send(text) then
-		prompt.clear()
+	if agent.send(text) then
+		-- Pasted, not yet submitted: an Esc in the agent's prompt would lose it all
+		write_json(sent_store, { draft = draft, items = plain(M.items) })
+		if not comments_only then
+			prompt.clear()
+		end
 		M.clear()
 	else
-		vim.notify("Draft and comments kept; <leader>aX clears them", vim.log.levels.WARN)
+		vim.notify((comments_only and "Comments" or "Draft and comments") .. " kept; <leader>aX clears them", vim.log.levels.WARN)
 	end
+end
+
+function M.submit_comments()
+	M.submit({ comments_only = true })
+end
+
+--- Bring back what the last submit sent, added to anything pending now
+function M.restore_sent()
+	local sent = read_json(sent_store)
+	if not sent then
+		vim.notify("Nothing submitted to restore", vim.log.levels.WARN)
+		return
+	end
+	local draft = vim.trim(sent.draft or "")
+	if draft ~= "" then
+		require("core.prompt").append(draft)
+	end
+	vim.list_extend(M.items, sent.items or {})
+	os.remove(sent_store)
+	render_all()
+	save()
+	vim.notify(("Restored %d comment%s%s"):format(
+		#(sent.items or {}),
+		#(sent.items or {}) == 1 and "" or "s",
+		draft ~= "" and " and the draft" or ""
+	))
+end
+
+M.items = read_json(store) or {}
+if #M.items > 0 then
+	vim.schedule(render_all)
 end
 
 local group = vim.api.nvim_create_augroup("agent-comments", { clear = true })
@@ -296,6 +368,16 @@ vim.api.nvim_create_autocmd({ "BufWinEnter", "BufReadPost" }, {
 	callback = function(ev)
 		if #M.items > 0 then
 			render(ev.buf)
+		end
+	end,
+})
+-- Keep positions that edits moved
+vim.api.nvim_create_autocmd("VimLeavePre", {
+	group = group,
+	callback = function()
+		if #M.items > 0 then
+			sync()
+			save()
 		end
 	end,
 })

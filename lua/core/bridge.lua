@@ -13,7 +13,7 @@ local M = {}
 --- Open the turn's review automatically when the agent stops
 M.review_on_stop = false
 
---- session id -> { agent = "claude"|"codex", state = "working"|"waiting"|"done", since, files }
+--- session id -> { agent = "claude"|"codex", state = "working"|"waiting"|"done", since, seen, pane, files }
 M.sessions = {}
 
 local dir = vim.fn.stdpath("state") .. "/agent-bridge"
@@ -93,6 +93,8 @@ end
 
 function M.on_event(ev)
 	local s = session(ev.session, ev.agent)
+	s.pane = ev.pane or s.pane
+	s.seen = os.time()
 	local event = ev.event
 	if event == "UserPromptSubmit" then
 		s.state, s.since, s.files = "working", os.time(), {}
@@ -132,6 +134,32 @@ local function current()
 		end
 	end
 	return best, n
+end
+
+--- tmux panes of the known sessions, most recently active first
+function M.panes()
+	local list = {}
+	for _, s in pairs(M.sessions) do
+		if s.pane then
+			table.insert(list, s)
+		end
+	end
+	table.sort(list, function(a, b)
+		return (a.seen or 0) > (b.seen or 0)
+	end)
+	return vim.tbl_map(function(s)
+		return s.pane
+	end, list)
+end
+
+--- True while any session is in the middle of a turn
+function M.busy()
+	for _, s in pairs(M.sessions) do
+		if s.state ~= "done" then
+			return true
+		end
+	end
+	return false
 end
 
 --- Statusline text: agent state plus pending review comments

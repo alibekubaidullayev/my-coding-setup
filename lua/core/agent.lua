@@ -3,9 +3,6 @@
 -- agent's prompt (not submitted) so you can add your comment and send it.
 local M = {}
 
--- Files written from this nvim since the last <leader>ae
-local edited = {}
-
 local function relpath(buf)
 	local name = vim.api.nvim_buf_get_name(buf)
 	local root = vim.fs.root(buf, ".git")
@@ -23,11 +20,35 @@ local function rel(path)
 	return vim.fs.relpath(repo_root(), path) or vim.fn.fnamemodify(path, ":~:.")
 end
 
+--- Per-repository file under stdpath("state")/<kind>/
+function M.state_file(kind, ext)
+	local dir = vim.fn.stdpath("state") .. "/" .. kind
+	vim.fn.mkdir(dir, "p")
+	return dir .. "/" .. repo_root():gsub("[/\\:]", "%%") .. ext
+end
+
+--- Where a buffer's lines live, for the agent: repo-relative path, plus a
+--- note on the revision for CodeDiff's read-only panes
+function M.location(buf)
+	local name = vim.api.nvim_buf_get_name(buf)
+	if name:match("^codediff://") then
+		local ok, vf = pcall(require, "codediff.core.virtual_file")
+		local parsed = ok and { vf.parse_url(name) } or {}
+		local rev, path = parsed[2], parsed[3]
+		if path then
+			return path, rev and (rev:match("^:") and "staged version" or ("at " .. rev:sub(1, 10)))
+		end
+	end
+	return relpath(buf)
+end
+
 --- `path:line` in normal mode; `path:start-end` plus the code in visual mode
 local function reference()
+	local path, note = M.location(0)
+	note = note and (" (" .. note .. ")") or ""
 	local mode = vim.fn.mode()
 	if not mode:match("^[vV\22]") then
-		return relpath(0) .. ":" .. vim.fn.line(".")
+		return path .. ":" .. vim.fn.line(".") .. note
 	end
 	local s, e = vim.fn.line("v"), vim.fn.line(".")
 	if s > e then
@@ -36,7 +57,7 @@ local function reference()
 	vim.api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
 	local lines = vim.api.nvim_buf_get_lines(0, s - 1, e, false)
 	return table.concat({
-		relpath(0) .. ":" .. (s == e and s or (s .. "-" .. e)),
+		path .. ":" .. (s == e and s or (s .. "-" .. e)) .. note,
 		"```" .. vim.bo.filetype,
 		table.concat(lines, "\n"),
 		"```",
@@ -48,33 +69,49 @@ local function tmux(args, input)
 	return vim.v.shell_error == 0 and out or nil
 end
 
--- Claude Code's native binary shows up as its version number (e.g. "2.1.283")
-local function is_agent(cmd)
-	return cmd:match("claude") or cmd:match("codex") or cmd:match("opencode") or cmd == "node"
-		or cmd:match("^%d+%.%d+%.%d+$")
+-- How sure a pane command is to be an agent: 2 certain, 1 maybe, nil no.
+-- Claude Code's native binary shows up as its version number (e.g. "2.1.283");
+-- "node" is the npm-installed one, but also any dev server.
+local function agent_score(cmd)
+	if cmd:match("claude") or cmd:match("codex") or cmd:match("opencode") or cmd:match("^%d+%.%d+%.%d+$") then
+		return 2
+	end
+	return cmd == "node" and 1 or nil
 end
 
---- Agent pane: in nvim's window first (preferring the pane you came from),
---- then anywhere in the session. A lone other pane in the window also counts.
+local shells = { zsh = true, bash = true, fish = true, sh = true }
+
+--- Agent pane: the one the agent's hooks reported (exact), else a guess: in
+--- nvim's window first (preferring the pane you came from), then anywhere in
+--- the session. A lone other pane in the window also counts.
 local function agent_pane()
 	if not vim.env.TMUX or not vim.env.TMUX_PANE then
 		return nil
 	end
+	-- Still alive and not back at the shell (agent quit without SessionEnd)
+	for _, pane in ipairs(require("core.bridge").panes()) do
+		local cmd = pane ~= vim.env.TMUX_PANE and tmux({ "display", "-p", "-t", pane, "#{pane_current_command}" })
+		if cmd and not shells[vim.trim(cmd)] then
+			return pane
+		end
+	end
 	local fmt = "#{pane_id}\t#{pane_last}\t#{pane_current_command}"
 	for _, scope in ipairs({ {}, { "-s" } }) do
 		local out = tmux(vim.list_extend({ "list-panes", "-t", vim.env.TMUX_PANE, "-F", fmt }, scope))
-		local agents, others = {}, {}
+		local best, best_score, others = nil, 0, {}
 		for _, line in ipairs(vim.split(out or "", "\n", { trimempty = true })) do
 			local id, last, cmd = line:match("^(%S+)\t(%d)\t(.*)$")
 			if id and id ~= vim.env.TMUX_PANE then
 				table.insert(others, id)
-				if is_agent(cmd) then
-					table.insert(agents, last == "1" and 1 or #agents + 1, id)
+				local score = agent_score(cmd)
+				score = score and (score * 2 + (last == "1" and 1 or 0))
+				if score and score > best_score then
+					best, best_score = id, score
 				end
 			end
 		end
-		if agents[1] then
-			return agents[1]
+		if best then
+			return best
 		end
 		if #scope == 0 and #others == 1 then
 			return others[1]
@@ -108,25 +145,60 @@ function M.send(text)
 	return false
 end
 
+local MAX_DIFF = 300
+
+--- Your edits since the agent last saw the tree (its last turn, or the last
+--- time it was told), as a diff. Works from the turn snapshots, so edits made
+--- outside nvim (lazygit, the shell) count too.
 function M.send_edited()
-	local files = vim.tbl_keys(edited)
-	if #files == 0 then
-		vim.notify("No files edited since the last note")
+	local turns = require("core.turns")
+	local root = turns.root()
+	if not root then
+		vim.notify("Not in a git repository", vim.log.levels.WARN)
 		return
 	end
-	table.sort(files)
-	M.send("I edited these files myself; re-read them before continuing:\n- " .. table.concat(files, "\n- "))
-	edited = {}
-end
+	local base = turns.baseline(root)
+	if not base then
+		vim.notify("No agent turn recorded yet to diff against", vim.log.levels.WARN)
+		return
+	end
+	if require("core.bridge").busy()
+		and vim.fn.confirm("The agent is mid-turn; its edits so far would show up as yours. Send anyway?", "&Send\n&Cancel", 2) ~= 1
+	then
+		return
+	end
+	local now = turns.tree(root)
+	local diff = now and turns.git(root, { "diff", "--no-color", "--no-ext-diff", "--no-renames", base, now })
+	if not diff or diff == "" then
+		vim.notify("No edits since the agent's last turn")
+		return
+	end
+	local files = turns.git(root, { "diff", "--name-only", "--no-renames", base, now }) or ""
+	local out = {
+		"I edited these files myself since your last turn; re-read them before changing them:",
+		"- " .. table.concat(vim.split(files, "\n", { trimempty = true }), "\n- "),
+	}
+	local lines = select(2, diff:gsub("\n", "")) + 1
+	if lines <= MAX_DIFF then
+		vim.list_extend(out, { "", "```diff", diff, "```" })
+	else
+		table.insert(out, ("\n(The diff is %d lines; read the files for the details.)"):format(lines))
+	end
 
-vim.api.nvim_create_autocmd("BufWritePost", {
-	group = vim.api.nvim_create_augroup("agent-edited-files", { clear = true }),
-	callback = function(ev)
-		if vim.bo[ev.buf].buftype == "" and vim.fs.root(ev.buf, ".git") then
-			edited[relpath(ev.buf)] = true
+	local unsaved = 0
+	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+		local name = vim.api.nvim_buf_get_name(buf)
+		if vim.bo[buf].modified and vim.bo[buf].buftype == "" and vim.fs.relpath(root, name) then
+			unsaved = unsaved + 1
 		end
-	end,
-})
+	end
+	if unsaved > 0 then
+		vim.notify(("%d unsaved buffer%s not included"):format(unsaved, unsaved == 1 and "" or "s"), vim.log.levels.WARN)
+	end
+	if M.send(table.concat(out, "\n")) then
+		turns.mark_told(root, now)
+	end
+end
 
 -- ── hand failures to the agent ───────────────────────────────────────────────
 
@@ -154,7 +226,11 @@ function M.send_diagnostics(scope)
 		vim.notify("No diagnostics to send")
 		return
 	end
+	-- Errors first, so the cap below never drops them for warnings
 	table.sort(diags, function(a, b)
+		if a.severity ~= b.severity then
+			return a.severity < b.severity
+		end
 		if a.bufnr ~= b.bufnr then
 			return a.bufnr < b.bufnr
 		end
@@ -311,6 +387,14 @@ function M.open_memory()
 		end
 		vim.api.nvim_win_close(win, true)
 	end, { buffer = buf, desc = "Save and close" })
+	-- The file stays open as a normal buffer: give `q` back once the float is gone
+	vim.api.nvim_create_autocmd("WinClosed", {
+		pattern = tostring(win),
+		once = true,
+		callback = function()
+			pcall(vim.keymap.del, "n", "q", { buffer = buf })
+		end,
+	})
 end
 
 -- ── keymaps ─────────────────────────────────────────────────────────────────
@@ -333,7 +417,7 @@ end, "copy reference (+ selection)")
 map({ "n", "x" }, "<leader>as", function()
 	M.send(reference())
 end, "send reference (+ selection) now")
-map("n", "<leader>ae", M.send_edited, "send list of files I edited")
+map("n", "<leader>ae", M.send_edited, "send my edits since last turn")
 map("n", "<leader>aa", function()
 	local pane = agent_pane()
 	if pane then
@@ -355,6 +439,8 @@ map("n", "<leader>aX", function()
 	end
 end, "discard comments + draft")
 map("n", "<leader>aS", lazy("core.comments", "submit"), "submit draft + comments")
+map("n", "<leader>aC", lazy("core.comments", "submit_comments"), "send comments only (keep draft)")
+map("n", "<leader>aP", lazy("core.comments", "restore_sent"), "restore last submitted draft + comments")
 map("n", "<leader>ap", lazy("core.prompt", "toggle"), "prompt draft")
 map({ "n", "x" }, "<leader>ai", function()
 	require("core.prompt").append(reference())
@@ -376,5 +462,16 @@ map("n", "<leader>at", M.send_test_failures, "send failing tests")
 -- Turns (the review side lives at <leader>gt / <leader>gT)
 map("n", "<leader>aU", lazy("core.turns", "undo_last"), "undo last agent turn")
 map("n", "<leader>am", M.open_memory, "edit CLAUDE.md / AGENTS.md")
+
+-- Review comments left from the last session: load them so they show again
+vim.api.nvim_create_autocmd("UIEnter", {
+	group = vim.api.nvim_create_augroup("agent-comments-restore", { clear = true }),
+	once = true,
+	callback = function()
+		if vim.uv.fs_stat(M.state_file("agent-comments", ".json")) then
+			require("core.comments")
+		end
+	end,
+})
 
 return M
