@@ -6,6 +6,9 @@
 -- alone under "Changes". <C-j>/<C-k> walk hunks across files, <C-S-j>/<C-S-k>
 -- jump between files, gc folds unchanged code, t toggles side-by-side/inline,
 -- <C-p> picks a file from the review, g? lists every key.
+--
+-- Talking back: <leader>ac comments on lines, <leader>ar rejects a hunk with a
+-- reason, <leader>aS sends them all (plus the <leader>ap draft) in one message.
 local function review(args)
 	return function()
 		require("core.review").toggle(args)
@@ -24,6 +27,9 @@ return {
 			{ "<leader>gH", "<cmd>CodeDiff history<cr>", desc = "Repo history" },
 			{ "<leader>gh", ":CodeDiff history<cr>", mode = "x", desc = "Selection history" },
 			{ "<leader>gw", function() require("core.review").toggle_whitespace() end, desc = "Diff: toggle whitespace" },
+			-- Agent turns (core/turns.lua): what one prompt changed, start vs end snapshot
+			{ "<leader>gt", function() require("core.turns").review_last() end, desc = "Review last agent turn" },
+			{ "<leader>gT", function() require("core.turns").pick() end, desc = "Agent turns (review / revert)" },
 		},
 		opts = {
 			diff = {

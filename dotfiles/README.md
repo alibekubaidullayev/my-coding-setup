@@ -37,6 +37,7 @@ It is safe to re-run: steps that are already done are skipped.
 | `direnv/`, `atuin/` | `~/.config/direnv/…`, `~/.config/atuin/config.toml` |
 | `lazygit/config.yml` | lazygit's config dir (differs between macOS and Linux) |
 | `karabiner/` (macOS) | `~/.config/karabiner` |
+| `codex/hooks.json` | `~/.codex/hooks.json`: Codex → nvim hooks (`scripts/agent-hook.lua`); approve them once with `/hooks` in Codex |
 
 Options: `--no-packages`, `--no-brew` (system packages only), `--no-nvim`,
 `--git-name` / `--git-email`, `-y` (no prompts), `-n` / `--dry-run`.

@@ -52,6 +52,15 @@ return {
 		build = ":TSUpdate",
 		config = function()
 			local ts = require("nvim-treesitter")
+			-- A clone left on the old `master` branch (lazy doesn't switch branches on
+			-- its own) has no install(): say how to fix it instead of erroring
+			if not ts.install then
+				vim.notify(
+					"nvim-treesitter is on its old `master` branch. Run :Lazy sync, then restart.",
+					vim.log.levels.WARN
+				)
+				return
+			end
 			ts.install({
 				"bash",
 				"c",

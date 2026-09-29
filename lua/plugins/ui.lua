@@ -188,6 +188,15 @@ return {
 						},
 					},
 					lualine_x = {
+						-- Agent state from Claude Code hooks + pending review comments (core/bridge.lua)
+						{
+							function()
+								return require("core.bridge").status()
+							end,
+							color = function()
+								return require("core.bridge").color()
+							end,
+						},
 						{ recording, color = "DiagnosticError" },
 						{
 							function()
@@ -336,6 +345,7 @@ return {
 			delay = 250,
 			icons = { mappings = true, rules = false },
 			spec = {
+				{ "<leader>a", group = "Agent", icon = "\u{f06a9}", mode = { "n", "x" } },
 				{ "<leader>b", group = "Buffer", icon = "\u{f0c5}" },
 				{ "<leader>c", group = "Code / Build", icon = "\u{f121}" },
 				{ "<leader>r", group = "Rename", icon = "\u{f044}" },

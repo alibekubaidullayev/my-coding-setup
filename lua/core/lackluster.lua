@@ -94,6 +94,10 @@ local function groups()
 		IblWhitespace = { fg = c.gray1 },
 		SatelliteBar = { bg = c.gray3 },
 
+		-- review comments for the agent (core/comments.lua)
+		AgentComment = { fg = c.mint, bg = c.bg_soft, italic = true },
+		AgentCommentSign = { fg = c.mint },
+
 		-- floats
 		NormalFloat = { fg = c.gray8, bg = c.bg },
 		FloatBorder = input,

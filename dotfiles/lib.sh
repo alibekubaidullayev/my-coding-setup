@@ -29,6 +29,7 @@ direnv/direnv.toml|.config/direnv/direnv.toml|all
 direnv/direnvrc|.config/direnv/direnvrc|all
 atuin/config.toml|.config/atuin/config.toml|all
 lazygit/config.yml|$(lazygit_dir)/config.yml|all
+codex/hooks.json|.codex/hooks.json|all
 karabiner|.config/karabiner|macos
 EOF
 }

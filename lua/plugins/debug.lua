@@ -333,6 +333,8 @@ return {
 						end,
 					}),
 				},
+				-- <leader>at hands the last run's failures to the agent (core/agent.lua)
+				consumers = { agent = require("core.agent").neotest_consumer },
 				status = { virtual_text = true },
 				output = { open_on_run = false },
 				quickfix = { enabled = false },

@@ -23,6 +23,12 @@ path_prepend_if_dir "/opt/homebrew/bin"
 path_prepend_if_dir "/home/linuxbrew/.linuxbrew/bin"
 path_prepend_if_dir "$HOME/.local/bin"
 path_append_if_dir "$HOME/.composer/vendor/bin"
+# Language servers nvim's Mason installs, so Claude Code's LSP plugins find them
+# too (appended: a brew/rustup/go install of the same server wins)
+path_append_if_dir "$HOME/.local/share/nvim/mason/bin"
+
+# Claude Code's Ctrl-G (edit prompt), git, etc. open nvim
+export EDITOR=nvim VISUAL=nvim
 
 # Go bins
 path_prepend_if_dir "$HOME/go/bin"

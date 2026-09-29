@@ -1,0 +1,73 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nvim -l \"$HOME/.config/nvim/scripts/agent-hook.lua\" UserPromptSubmit codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nvim -l \"$HOME/.config/nvim/scripts/agent-hook.lua\" PostToolUse codex",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nvim -l \"$HOME/.config/nvim/scripts/agent-hook.lua\" PermissionRequest codex",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nvim -l \"$HOME/.config/nvim/scripts/agent-hook.lua\" Stop codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nvim -l \"$HOME/.config/nvim/scripts/agent-hook.lua\" Interrupt codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nvim -l \"$HOME/.config/nvim/scripts/agent-hook.lua\" SessionEnd codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

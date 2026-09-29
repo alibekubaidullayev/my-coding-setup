@@ -212,8 +212,7 @@ fi
 
 # ── tmux plugins ───────────────────────────────────────────────────────────────
 step "tmux plugins"
-# Clone what tmux.conf lists instead of running tpm's installer: that needs a tmux
-# server, and tmux-continuum would restore saved sessions into it
+# Clone what tmux.conf lists instead of running tpm's installer: that needs a tmux server
 grep -E "^set(-option)? +-g +@plugin +" "$DOT_DIR/tmux/tmux.conf" | sed -E "s/.*@plugin +['\"]?([^'\" ]+)['\"]?.*/\1/" |
 	while read -r plugin; do
 		clone "https://github.com/$plugin.git" "$HOME/.tmux/plugins/${plugin##*/}"
